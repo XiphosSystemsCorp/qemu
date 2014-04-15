@@ -190,7 +190,9 @@ static const FlashPartInfo known_devices[] = {
     { INFO("w25q64",      0xef4017,      0,  64 << 10, 128, ER_4K) },
 
     /* Numonyx -- n25q128 */
-    { INFO("n25q128",      0x20ba18,      0,  64 << 10, 256, 0) },
+    { INFO("n25q128",     0x20ba18,      0,  64 << 10, 256, 0) },
+    { INFO("n25q512a",    0x20bb20,      0,  64 << 10,1024, ER_4K) },
+    { INFO("n25q512a11",  0x20bb20,      0,  64 << 10,1024, ER_4K) },
 };
 
 typedef enum {
@@ -216,6 +218,14 @@ typedef enum {
     ERASE_4K = 0x20,
     ERASE_32K = 0x52,
     ERASE_SECTOR = 0xd8,
+
+    /* for Micron QSPI flash */
+    /* Enable 4-byte mode */
+    EN4B = 0xb7,
+    EX4B = 0xe9,
+
+    RDFSR = 0x70, /* Read Flag Status Register */
+    
 } FlashCMD;
 
 typedef enum {
@@ -244,6 +254,8 @@ typedef struct Flash {
     uint8_t cmd_in_progress;
     uint64_t cur_addr;
     bool write_enable;
+
+    bool mode_4byte_addr;
 
     int64_t dirty_page;
 
@@ -366,6 +378,7 @@ void flash_write8(Flash *s, uint64_t addr, uint8_t data)
         DB_PRINT_L(1, "programming zero to one! addr=%" PRIx64 "  %" PRIx8
                    " -> %" PRIx8 "\n", addr, prev, data);
     }
+    DB_PRINT_L(0,"Writing %x to %" PRIx64 "\n",data,s->cur_addr);
 
     if (s->pi->flags & WR_1) {
         s->storage[s->cur_addr] = data;
@@ -379,9 +392,16 @@ void flash_write8(Flash *s, uint64_t addr, uint8_t data)
 
 static void complete_collecting_data(Flash *s)
 {
-    s->cur_addr = s->data[0] << 16;
-    s->cur_addr |= s->data[1] << 8;
-    s->cur_addr |= s->data[2];
+    if (!s->mode_4byte_addr) {
+        s->cur_addr = s->data[0] << 16;
+        s->cur_addr |= s->data[1] << 8;
+        s->cur_addr |= s->data[2];
+    } else {
+        s->cur_addr = s->data[0] << 24;
+        s->cur_addr |= s->data[1] << 16;
+        s->cur_addr |= s->data[2] << 8;
+        s->cur_addr |= s->data[3];
+    }
 
     s->state = STATE_IDLE;
 
@@ -389,6 +409,8 @@ static void complete_collecting_data(Flash *s)
     case DPP:
     case QPP:
     case PP:
+        DB_PRINT_L(0,"XPP: cur_addr=%" PRIx64 "data [ %02x %02x %02x %02x ]\n",
+          s->cur_addr,s->data[0],s->data[1],s->data[2],s->data[3]);
         s->state = STATE_PAGE_PROGRAM;
         break;
     case READ:
@@ -428,7 +450,11 @@ static void decode_new_cmd(Flash *s, uint32_t value)
     case DPP:
     case QPP:
     case PP:
-        s->needed_bytes = 3;
+        if (!s->mode_4byte_addr) {
+            s->needed_bytes = 3;
+        } else {
+            s->needed_bytes = 4;
+        }
         s->pos = 0;
         s->len = 0;
         s->state = STATE_COLLECTING_DATA;
@@ -437,7 +463,11 @@ static void decode_new_cmd(Flash *s, uint32_t value)
     case FAST_READ:
     case DOR:
     case QOR:
-        s->needed_bytes = 4;
+        if (!s->mode_4byte_addr) {
+            s->needed_bytes = 4;
+        } else {
+            s->needed_bytes = 5;
+        }
         s->pos = 0;
         s->len = 0;
         s->state = STATE_COLLECTING_DATA;
@@ -496,6 +526,17 @@ static void decode_new_cmd(Flash *s, uint32_t value)
         s->state = STATE_READING_DATA;
         break;
 
+    case RDFSR:
+#define FSR_RDY			0x80	/* Ready/Busy program erase */
+        s->data[0] = FSR_RDY;
+    DB_PRINT_L(0, "Setting FSR to :%x\n", s->data[0]);
+        s->pos = 0;
+        s->len = 1;
+        s->state = STATE_READING_DATA;
+        break;
+
+    
+
     case JEDEC_READ:
         DB_PRINT_L(0, "populated jedec code\n");
         s->data[0] = (s->pi->jedec >> 16) & 0xff;
@@ -520,6 +561,13 @@ static void decode_new_cmd(Flash *s, uint32_t value)
             qemu_log_mask(LOG_GUEST_ERROR, "M25P80: chip erase with write "
                           "protect!\n");
         }
+        break;
+    /* TODO: Restrict operation to specific vendors */
+    case EN4B:
+        s->mode_4byte_addr = true;
+        break;
+    case EX4B:
+        s->mode_4byte_addr = false;
         break;
     case NOP:
         break;
@@ -577,6 +625,7 @@ static uint32_t m25p80_transfer8(SSISlave *ss, uint32_t tx)
 
     case STATE_READING_DATA:
         r = s->data[s->pos];
+    DB_PRINT_L(0, "Reading data: %x\n", r);
         s->pos++;
         if (s->pos == s->len) {
             s->pos = 0;
