@@ -240,7 +240,11 @@ static int usb_host_get_port(libusb_device *dev, char *port, size_t len)
     size_t off;
     int rc, i;
 
+    /* libusb_get_port_path is deprecated
+ * http://libusb.6.n5.nabble.com/libusb-Announcing-libusbx-1-0-16-rc1-td5712073.html
     rc = libusb_get_port_path(ctx, dev, path, 7);
+    */
+    rc = libusb_get_port_numbers(dev, path, 7);
     if (rc < 0) {
         return 0;
     }
